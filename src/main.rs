@@ -83,9 +83,13 @@ struct Cli {
 	port: u16,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
 	let cli = Cli::parse();
+	run(cli);
+}
+
+#[tokio::main]
+async fn run(cli: Cli) {
 
 	tracing_subscriber::registry()
 		.with(tracing_subscriber::fmt::layer())

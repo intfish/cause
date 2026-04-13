@@ -1,0 +1,9 @@
+# global settings
+# [global]
+# auth_header = 'x-api-key'
+# timeout = 900
+
+[example]
+shell = "/usr/bin/bash"
+args = [ "examples/loop.sh" ]
+keys = "examples/keys"

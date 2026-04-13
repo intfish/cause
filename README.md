@@ -14,3 +14,9 @@ Options:
   -h, --help               Print help
   -V, --version            Print version
 ```
+
+generating a key:
+
+```sh
+mkpasswd super53cr37 >> keys
+```

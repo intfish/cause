@@ -1,0 +1,13 @@
+/target
+
+.~*
+*.swp
+*.gz
+*.log
+
+.env
+docker-compose.override.yml
+
+.idea
+.vscode
+

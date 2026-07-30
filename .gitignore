@@ -10,4 +10,5 @@ docker-compose.override.yml
 
 .idea
 .vscode
-
+.opencode
+opencode.json

@@ -11,6 +11,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod auth;
 mod config;
 mod handler;
+
+#[cfg(test)]
 mod tests;
 
 use auth::{FailureTracker, Keys};

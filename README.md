@@ -2,6 +2,9 @@
 
 cause provides a basic and argument-less API for triggering things in remote machines over HTTP with reasonable security.
 
+things to note:
+- the process, once triggered, will run to completion/timeout even if the triggering party disconnects
+
 ## usage
 
 Use behind a reverse proxy like caddy or nginx that provides TLS termination.

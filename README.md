@@ -35,4 +35,7 @@ use the full key (`keyid.secret`) as the value in the `x-api-key` (by default) h
 
 ## development
 
-the example key in `example/keys` is `a1b2c3d4.dev`.
+- the example key in `example/keys` is `a1b2c3d4.dev`.
+- running the example:
+  - `cargo run`
+  - `curl -i -XPOST -H 'x-api-key: a1b2c3d4.dev' http://localhost:3000/example`

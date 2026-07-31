@@ -4,7 +4,7 @@
 # timeout = 900
 # trusted_proxies = ["127.0.0.1", "::1"]
 
-[example]
+[routes.example]
 shell = "/usr/bin/bash"
 args = [ "examples/loop.sh" ]
 keys = "examples/keys"

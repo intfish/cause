@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8.1", features = ["macros"] }
-tokio = { version = "1.43.0", features = ["full"] }
-serde = { version = "1.0.217", features = ["derive"] }
-toml = "0.8.19"
-yescrypt = { version = "0.1.0-rc.5", features = ["password-hash"] }
-futures-util = "0.3.31"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-clap = { version = "4.5.28", features = ["derive"] }
+axum = { version = "0.8.9", features = ["macros"] }
+tokio = { version = "1.53.1", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+yescrypt = { version = "0.1.0", features = ["password-hash"] }
+futures-util = "0.3.33"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+clap = { version = "4.6.4", features = ["derive"] }

@@ -1,10 +1,13 @@
 use ax_extract::ConnectInfo;
 use axum::{
+	Router,
 	extract::{self as ax_extract, State},
 	http::{HeaderMap, StatusCode},
-	response::{sse::{Event, KeepAlive}, Sse},
+	response::{
+		Sse,
+		sse::{Event, KeepAlive},
+	},
 	routing::get,
-	Router,
 };
 use clap::Parser;
 use futures_util::stream::{self, Stream};
@@ -13,10 +16,10 @@ use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tracing::{warn, error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use yescrypt::password_hash::PasswordVerifier;
 use yescrypt::Yescrypt;
+use yescrypt::password_hash::PasswordVerifier;
 
 #[derive(Deserialize, Clone, Debug)]
 struct GlobalConfig {
@@ -76,7 +79,8 @@ struct Keys {
 
 impl Keys {
 	fn from_file(path: &str) -> Result<Self, String> {
-		let content = fs::read_to_string(path).map_err(|e| format!("failed to read keys file {}: {}", path, e))?;
+		let content = fs::read_to_string(path)
+			.map_err(|e| format!("failed to read keys file {}: {}", path, e))?;
 		let mut hashes = Vec::new();
 		for line in content.lines() {
 			let hash = line.trim().to_string();
@@ -90,7 +94,10 @@ impl Keys {
 
 	fn verify(&self, key: &str) -> bool {
 		for hash in &self.hashes {
-			if Yescrypt::default().verify_password(key.as_bytes(), hash.as_str()).is_ok() {
+			if Yescrypt::default()
+				.verify_password(key.as_bytes(), hash.as_str())
+				.is_ok()
+			{
 				return true;
 			}
 		}
@@ -127,10 +134,12 @@ fn main() {
 
 #[tokio::main]
 async fn run(cli: Cli) {
-
 	tracing_subscriber::registry()
 		.with(tracing_subscriber::fmt::layer())
-		.with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "cause=debug,tower_http=debug,axum::rejection=trace".into()))
+		.with(
+			tracing_subscriber::EnvFilter::try_from_default_env()
+				.unwrap_or_else(|_| "cause=debug,axum::rejection=trace".into()),
+		)
 		.init();
 
 	let config_path = &cli.config;
@@ -154,14 +163,14 @@ async fn run(cli: Cli) {
 	let mut keys = HashMap::new();
 	for (name, route) in &config.routes {
 		match Keys::from_file(&route.keys) {
-		Ok(parsed) => {
+			Ok(parsed) => {
 				info!("[+] loaded keys for route: {}", name);
 				keys.insert(name.clone(), parsed);
-			},
+			}
 			Err(e) => {
 				error!("[!] {}", e);
 				std::process::exit(1);
-			},
+			}
 		}
 	}
 
@@ -170,7 +179,11 @@ async fn run(cli: Cli) {
 		semaphores.insert(name.clone(), Arc::new(Semaphore::new(route.concurrency)));
 	}
 
-	let state = Arc::new(AppState { config: config.clone(), keys, semaphores });
+	let state = Arc::new(AppState {
+		config: config.clone(),
+		keys,
+		semaphores,
+	});
 
 	let mut router = Router::new();
 
@@ -181,7 +194,9 @@ async fn run(cli: Cli) {
 		let route_name_cloned = route_name.clone();
 		router = router.route(
 			&route_path,
-			get(move |headers, connect_info, state| handle_route(route_name_cloned, headers, connect_info, state, semaphore)),
+			get(move |headers, connect_info, state| {
+				handle_route(route_name_cloned, headers, connect_info, state, semaphore)
+			}),
 		);
 	}
 
@@ -192,7 +207,12 @@ async fn run(cli: Cli) {
 
 	info!("[+] listening on {}", addr);
 	let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-	axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+	axum::serve(
+		listener,
+		router.into_make_service_with_connect_info::<SocketAddr>(),
+	)
+	.await
+	.unwrap();
 }
 
 async fn handle_route(
@@ -201,7 +221,8 @@ async fn handle_route(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	State(state): State<Arc<AppState>>,
 	semaphore: Arc<Semaphore>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)> {
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)>
+{
 	let x_forwarded_for = headers
 		.get("X-Forwarded-For")
 		.and_then(|v| v.to_str().ok())
@@ -250,7 +271,10 @@ async fn handle_route(
 		.spawn()
 		.map_err(|e| {
 			error!("[!] failed to spawn: {}: {}", route_name, e);
-			(StatusCode::INTERNAL_SERVER_ERROR, "Failed to execute shell".to_string())
+			(
+				StatusCode::INTERNAL_SERVER_ERROR,
+				"Failed to execute shell".to_string(),
+			)
 		})?;
 
 	info!(
@@ -265,7 +289,11 @@ async fn handle_route(
 	tokio::spawn(async move {
 		match tokio::time::timeout(timeout_duration, child.wait()).await {
 			Ok(Ok(status)) => {
-				info!("[+] exit: {}: return: {:?}", route_name, status.code().unwrap_or(-1));
+				info!(
+					"[+] exit: {}: return: {:?}",
+					route_name,
+					status.code().unwrap_or(-1)
+				);
 			}
 			Ok(Err(e)) => {
 				error!("[!] failed to wait on child: {}: {}", route_name, e);
@@ -284,10 +312,12 @@ async fn handle_route(
 	let stdout_stream = futures_util::stream::unfold(stdout_reader, |mut reader| async {
 		match reader.next_line().await {
 			Ok(Some(line)) => Some((
-				Ok(Event::default().json_data(OutputLine {
-					r#type: "stdout".to_string(),
-					line,
-				}).unwrap()),
+				Ok(Event::default()
+					.json_data(OutputLine {
+						r#type: "stdout".to_string(),
+						line,
+					})
+					.unwrap()),
 				reader,
 			)),
 			_ => None,
@@ -297,10 +327,12 @@ async fn handle_route(
 	let stderr_stream = futures_util::stream::unfold(stderr_reader, |mut reader| async {
 		match reader.next_line().await {
 			Ok(Some(line)) => Some((
-				Ok(Event::default().json_data(OutputLine {
-					r#type: "stderr".to_string(),
-					line,
-				}).unwrap()),
+				Ok(Event::default()
+					.json_data(OutputLine {
+						r#type: "stderr".to_string(),
+						line,
+					})
+					.unwrap()),
 				reader,
 			)),
 			_ => None,

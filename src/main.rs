@@ -22,11 +22,37 @@ use std::{
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use tower_governor::GovernorLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tower_governor::GovernorLayer;
-use yescrypt::password_hash::PasswordVerifier;
 use yescrypt::Yescrypt;
+use yescrypt::password_hash::PasswordVerifier;
+
+/// Resolves the effective client IP from the TCP peer address and proxy headers.
+/// X-Forwarded-For => X-Real-IP => TCP peer address
+fn resolve_client_ip(addr: SocketAddr, headers: &HeaderMap, trusted_proxies: &[IpAddr]) -> IpAddr {
+	if trusted_proxies.contains(&addr.ip()) {
+		if let Some(ip) = headers
+			.get("x-forwarded-for")
+			.and_then(|v| v.to_str().ok())
+			.and_then(|s| {
+				s.split(',')
+					.rev()
+					.filter_map(|p| p.trim().parse::<IpAddr>().ok())
+					.find(|ip| !trusted_proxies.contains(ip))
+			}) {
+			return ip;
+		}
+		if let Some(ip) = headers
+			.get("x-real-ip")
+			.and_then(|v| v.to_str().ok())
+			.and_then(|s| s.trim().parse::<IpAddr>().ok())
+		{
+			return ip;
+		}
+	}
+	addr.ip()
+}
 
 #[derive(Deserialize, Clone, Debug)]
 struct GlobalConfig {
@@ -34,6 +60,8 @@ struct GlobalConfig {
 	auth_header: String,
 	#[serde(default = "default_timeout")]
 	timeout: u64,
+	#[serde(default)]
+	trusted_proxies: Vec<IpAddr>,
 }
 
 fn default_auth_header() -> String {
@@ -49,6 +77,7 @@ impl Default for GlobalConfig {
 		Self {
 			auth_header: default_auth_header(),
 			timeout: default_timeout(),
+			trusted_proxies: Vec::new(),
 		}
 	}
 }
@@ -88,8 +117,7 @@ struct Keys {
 
 impl Keys {
 	fn from_file(path: &str) -> Result<Self, String> {
-		let content = fs::read_to_string(path)
-			.map_err(|e| format!("failed to read keys file {}: {}", path, e))?;
+		let content = fs::read_to_string(path).map_err(|e| format!("failed to read keys file {}: {}", path, e))?;
 		let mut hashes: HashMap<String, Vec<String>> = HashMap::new();
 		for line in content.lines() {
 			let line = line.trim();
@@ -97,9 +125,9 @@ impl Keys {
 				continue;
 			}
 			// require keyid:hash format
-			let (key_id, hash) = line.split_once(':').ok_or_else(|| {
-				format!("malformed line in {}: (no ':'): {}", path, line)
-			})?;
+			let (key_id, hash) = line
+				.split_once(':')
+				.ok_or_else(|| format!("malformed line in {}: (no ':'): {}", path, line))?;
 			let key_id = key_id.to_string();
 			let hash = hash.to_string();
 			hashes.entry(key_id).or_default().push(hash);
@@ -166,9 +194,7 @@ impl FailureTracker {
 	fn is_blocked(&self, addr: IpAddr) -> bool {
 		let map = self.fails.lock().unwrap();
 		match map.get(&addr) {
-			Some((count, since)) => {
-				since.elapsed() <= self.window && *count >= self.max_fails
-			}
+			Some((count, since)) => since.elapsed() <= self.window && *count >= self.max_fails,
 			None => false,
 		}
 	}
@@ -299,11 +325,37 @@ async fn run(cli: Cli) {
 	info!("[+] listening on {}", addr);
 	let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
-	// spawn background task to clean up rate limiter and failure tracker storage
+	let router = if !config.global.trusted_proxies.is_empty() {
+		rate_limited(
+			router,
+			tower_governor::key_extractor::SmartIpKeyExtractor,
+			failure_tracker,
+		)
+	} else {
+		rate_limited(
+			router,
+			tower_governor::key_extractor::PeerIpKeyExtractor,
+			failure_tracker,
+		)
+	};
+
+	axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+		.await
+		.unwrap();
+}
+
+/// Wraps the router with a governor rate-limiting layer using the given key extractor
+/// and spawns a background task to clean up rate limiter and failure tracker storage.
+fn rate_limited<K>(router: Router, key_extractor: K, failure_tracker: Arc<FailureTracker>) -> Router
+where
+	K: tower_governor::key_extractor::KeyExtractor + Send + Sync + 'static,
+	K::Key: Send + Sync + 'static,
+{
 	let governor_conf = Arc::new(
 		tower_governor::governor::GovernorConfigBuilder::default()
 			.per_second(2)
 			.burst_size(5)
+			.key_extractor(key_extractor)
 			.finish()
 			.unwrap(),
 	);
@@ -316,15 +368,7 @@ async fn run(cli: Cli) {
 			failure_tracker.prune();
 		}
 	});
-
-	let router = router.layer(GovernorLayer::new(governor_conf));
-
-	axum::serve(
-		listener,
-		router.into_make_service_with_connect_info::<SocketAddr>(),
-	)
-	.await
-	.unwrap();
+	router.layer(GovernorLayer::new(governor_conf))
 }
 
 async fn handle_route(
@@ -333,22 +377,16 @@ async fn handle_route(
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	State(state): State<Arc<AppState>>,
 	semaphore: Arc<Semaphore>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)>
-{
-	let x_forwarded_for = headers
-		.get("X-Forwarded-For")
-		.and_then(|v| v.to_str().ok())
-		.unwrap_or("-");
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)> {
+	let client_ip = resolve_client_ip(addr, &headers, &state.config.global.trusted_proxies);
 
-	info!(
-		"[+] request: {}: client_ip: {}, x_forwarded_for: {}",
-		route_name, addr, x_forwarded_for
-	);
+	info!("[+] request: {}: client_ip: {}", route_name, client_ip);
 
-	let route_config = state.config.routes.get(&route_name).ok_or((
-		StatusCode::NOT_FOUND,
-		format!("Route {} not found", route_name),
-	))?;
+	let route_config = state
+		.config
+		.routes
+		.get(&route_name)
+		.ok_or((StatusCode::NOT_FOUND, format!("Route {} not found", route_name)))?;
 
 	let auth_header_name = &state.config.global.auth_header;
 	let auth_key = headers
@@ -356,15 +394,10 @@ async fn handle_route(
 		.and_then(|h| h.to_str().ok())
 		.ok_or((StatusCode::UNAUTHORIZED, "Missing auth header".to_string()))?;
 
-	let client_ip = addr.ip();
-
 	// check failure tracker before any auth work
 	if state.failure_tracker.is_blocked(client_ip) {
 		state.failure_tracker.refresh_block(client_ip);
-		warn!(
-			"[!] blocked: {} exceeded failure threshold",
-			client_ip
-		);
+		warn!("[!] blocked: {} exceeded failure threshold", client_ip);
 		tokio::time::sleep(Duration::from_millis(500)).await;
 		return Err((StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts".to_string()));
 	}
@@ -390,15 +423,12 @@ async fn handle_route(
 	// run yescrypt in a blocking thread
 	let key_clone = auth_key.to_string();
 	let keys_for_verify = route_keys.clone();
-	let verified = match tokio::task::spawn_blocking(move || keys_for_verify.verify(&key_clone))
+	let verified = tokio::task::spawn_blocking(move || keys_for_verify.verify(&key_clone))
 		.await
-	{
-		Ok(result) => result,
-		Err(e) => {
+		.unwrap_or_else(|e| {
 			error!("[!] spawn_blocking panic during auth: {}", e);
 			false
-		}
-	};
+		});
 
 	drop(auth_permit);
 
@@ -430,16 +460,10 @@ async fn handle_route(
 		.spawn()
 		.map_err(|e| {
 			error!("[!] failed to spawn: {}: {}", route_name, e);
-			(
-				StatusCode::INTERNAL_SERVER_ERROR,
-				"Failed to execute shell".to_string(),
-			)
+			(StatusCode::INTERNAL_SERVER_ERROR, "Failed to execute shell".to_string())
 		})?;
 
-	info!(
-		"[+] spawn: {}: client_ip: {}, x_forwarded_for: {}",
-		route_name, addr, x_forwarded_for
-	);
+	info!("[+] spawn: {}: client_ip: {}", route_name, client_ip);
 	let stdout = child.stdout.take().unwrap();
 	let stderr = child.stderr.take().unwrap();
 
@@ -448,11 +472,7 @@ async fn handle_route(
 	tokio::spawn(async move {
 		match tokio::time::timeout(timeout_duration, child.wait()).await {
 			Ok(Ok(status)) => {
-				info!(
-					"[+] exit: {}: return: {:?}",
-					route_name,
-					status.code().unwrap_or(-1)
-				);
+				info!("[+] exit: {}: return: {:?}", route_name, status.code().unwrap_or(-1));
 			}
 			Ok(Err(e)) => {
 				error!("[!] failed to wait on child: {}: {}", route_name, e);
@@ -468,38 +488,29 @@ async fn handle_route(
 	let stdout_reader = BufReader::new(stdout).lines();
 	let stderr_reader = BufReader::new(stderr).lines();
 
-	let stdout_stream = futures_util::stream::unfold(stdout_reader, |mut reader| async {
-		match reader.next_line().await {
-			Ok(Some(line)) => Some((
-				Ok(Event::default()
-					.json_data(OutputLine {
-						r#type: "stdout".to_string(),
-						line,
-					})
-					.unwrap()),
-				reader,
-			)),
-			_ => None,
-		}
-	});
+	fn line_event_stream<R: tokio::io::AsyncBufRead + Unpin>(
+		reader: tokio::io::Lines<R>,
+		r#type: &'static str,
+	) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+		stream::unfold(reader, move |mut reader| async move {
+			match reader.next_line().await {
+				Ok(Some(line)) => Some((
+					Ok(Event::default()
+						.json_data(OutputLine {
+							r#type: r#type.to_string(),
+							line,
+						})
+						.unwrap()),
+					reader,
+				)),
+				_ => None,
+			}
+		})
+	}
 
-	let stderr_stream = futures_util::stream::unfold(stderr_reader, |mut reader| async {
-		match reader.next_line().await {
-			Ok(Some(line)) => Some((
-				Ok(Event::default()
-					.json_data(OutputLine {
-						r#type: "stderr".to_string(),
-						line,
-					})
-					.unwrap()),
-				reader,
-			)),
-			_ => None,
-		}
-	});
-
+	let stdout_stream = line_event_stream(stdout_reader, "stdout");
+	let stderr_stream = line_event_stream(stderr_reader, "stderr");
 	let combined_stream = stream::select(stdout_stream, stderr_stream);
-
 	Ok(Sse::new(combined_stream).keep_alive(KeepAlive::default()))
 }
 
@@ -511,9 +522,7 @@ mod tests {
 	#[test]
 	fn test_keys_verify_valid() {
 		let yescrypt = Yescrypt::default();
-		let hash_obj = yescrypt
-			.hash_password(b"super53cr37")
-			.expect("hashing failed");
+		let hash_obj = yescrypt.hash_password(b"super53cr37").expect("hashing failed");
 		let hash_str = hash_obj.to_string();
 		let key_id = "testkey1";
 		let keys = Keys {
@@ -530,10 +539,7 @@ mod tests {
 	#[test]
 	fn test_keys_verify_wrong_secret() {
 		let yescrypt = Yescrypt::default();
-		let hash = yescrypt
-			.hash_password(b"correct")
-			.expect("hashing failed")
-			.to_string();
+		let hash = yescrypt.hash_password(b"correct").expect("hashing failed").to_string();
 		let key_id = "testkey2";
 		let keys = Keys {
 			hashes: {
@@ -573,7 +579,11 @@ mod tests {
 	fn test_keys_from_file_rejects_malformed() {
 		let dir = std::env::temp_dir();
 		let path = dir.join("cause_test_malformed_keys");
-		fs::write(&path, "$y$j9T$xlKmMsoZxul/zvPXLC/Aj.$m0BFqZYiyDAF7bh/Tb3.CDTH5kgmBfBRhXbKAO0nco7\n").unwrap();
+		fs::write(
+			&path,
+			"$y$j9T$xlKmMsoZxul/zvPXLC/Aj.$m0BFqZYiyDAF7bh/Tb3.CDTH5kgmBfBRhXbKAO0nco7\n",
+		)
+		.unwrap();
 		let result = Keys::from_file(path.to_str().unwrap());
 		assert!(result.is_err());
 		fs::remove_file(&path).ok();
@@ -583,7 +593,11 @@ mod tests {
 	fn test_keys_from_file_accepts_keyid_format() {
 		let dir = std::env::temp_dir();
 		let path = dir.join("cause_test_keyid_keys");
-		fs::write(&path, "a1b2c3d4:$y$j9T$xlKmMsoZxul/zvPXLC/Aj.$m0BFqZYiyDAF7bh/Tb3.CDTH5kgmBfBRhXbKAO0nco7\n").unwrap();
+		fs::write(
+			&path,
+			"a1b2c3d4:$y$j9T$xlKmMsoZxul/zvPXLC/Aj.$m0BFqZYiyDAF7bh/Tb3.CDTH5kgmBfBRhXbKAO0nco7\n",
+		)
+		.unwrap();
 		let result = Keys::from_file(path.to_str().unwrap());
 		assert!(result.is_ok());
 		fs::remove_file(&path).ok();

@@ -2,6 +2,7 @@
 # [global]
 # auth_header = 'x-api-key'
 # timeout = 900
+# trusted_proxies = ["127.0.0.1", "::1"]
 
 [example]
 shell = "/usr/bin/bash"

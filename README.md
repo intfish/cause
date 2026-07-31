@@ -17,8 +17,19 @@ Options:
   -V, --version            Print version
 ```
 
-Generating a key:
+Generating a key: `./key.sh <key>`
 
 ```sh
-mkpasswd super53cr37 >> keys
+# it does the following:
+# generate a yescrypt hash
+HASH=$(mkpasswd -m yescrypt super53cr37)
+# prepend a random 8-char key ID (public)
+KEYID=$(head -c 4 /dev/urandom | xxd -p)
+echo "${KEYID}:${HASH}" >> keys
 ```
+
+Use the full key (`keyid.secret`) as the value in the `x-api-key` (by default) header.
+
+## development
+
+The example key in `example/keys` is `a1b2c3d4.dev`.

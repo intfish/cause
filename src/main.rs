@@ -12,14 +12,21 @@ use axum::{
 use clap::Parser;
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+	collections::HashMap,
+	fs,
+	net::{IpAddr, SocketAddr},
+	sync::{Arc, Mutex},
+	time::{Duration, Instant},
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use yescrypt::Yescrypt;
+use tower_governor::GovernorLayer;
 use yescrypt::password_hash::PasswordVerifier;
+use yescrypt::Yescrypt;
 
 #[derive(Deserialize, Clone, Debug)]
 struct GlobalConfig {
@@ -69,33 +76,49 @@ struct Config {
 
 #[derive(Serialize, Debug)]
 struct OutputLine {
-	r#type: String, // "stdout" or "stderr"
+	r#type: String,
 	line: String,
 }
 
+#[derive(Clone)]
 struct Keys {
-	hashes: Vec<String>,
+	// key_id -> list of yescrypt hashes (tolerates ID collisions)
+	hashes: HashMap<String, Vec<String>>,
 }
 
 impl Keys {
 	fn from_file(path: &str) -> Result<Self, String> {
 		let content = fs::read_to_string(path)
 			.map_err(|e| format!("failed to read keys file {}: {}", path, e))?;
-		let mut hashes = Vec::new();
+		let mut hashes: HashMap<String, Vec<String>> = HashMap::new();
 		for line in content.lines() {
-			let hash = line.trim().to_string();
-			if hash.is_empty() {
+			let line = line.trim();
+			if line.is_empty() {
 				continue;
 			}
-			hashes.push(hash);
+			// require keyid:hash format
+			let (key_id, hash) = line.split_once(':').ok_or_else(|| {
+				format!("malformed line in {}: (no ':'): {}", path, line)
+			})?;
+			let key_id = key_id.to_string();
+			let hash = hash.to_string();
+			hashes.entry(key_id).or_default().push(hash);
 		}
 		Ok(Self { hashes })
 	}
 
 	fn verify(&self, key: &str) -> bool {
-		for hash in &self.hashes {
+		let (key_id, secret) = match key.split_once('.') {
+			Some((id, secret)) => (id, secret),
+			None => return false,
+		};
+		let hash_list = match self.hashes.get(key_id) {
+			Some(list) => list,
+			None => return false,
+		};
+		for hash in hash_list {
 			if Yescrypt::default()
-				.verify_password(key.as_bytes(), hash.as_str())
+				.verify_password(secret.as_bytes(), hash.as_str())
 				.is_ok()
 			{
 				return true;
@@ -105,10 +128,53 @@ impl Keys {
 	}
 }
 
+struct FailureTracker {
+	fails: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+	max_fails: u32,
+	window: Duration,
+}
+
+impl FailureTracker {
+	fn new(max_fails: u32, window: Duration) -> Self {
+		Self {
+			fails: Mutex::new(HashMap::new()),
+			max_fails,
+			window,
+		}
+	}
+
+	fn record(&self, addr: IpAddr, success: bool) {
+		let mut map = self.fails.lock().unwrap();
+		if success {
+			map.remove(&addr);
+			return;
+		}
+		let entry = map.entry(addr).or_insert((0, Instant::now()));
+		let (count, since) = *entry;
+		if since.elapsed() > self.window {
+			*entry = (1, Instant::now());
+			return;
+		}
+		entry.0 = count + 1;
+	}
+
+	fn is_blocked(&self, addr: IpAddr) -> bool {
+		let map = self.fails.lock().unwrap();
+		match map.get(&addr) {
+			Some((count, since)) => {
+				since.elapsed() <= self.window && *count >= self.max_fails
+			}
+			None => false,
+		}
+	}
+}
+
 struct AppState {
 	config: Config,
 	keys: HashMap<String, Keys>,
 	semaphores: HashMap<String, Arc<Semaphore>>,
+	auth_semaphore: Arc<Semaphore>,
+	failure_tracker: Arc<FailureTracker>,
 }
 
 #[derive(Parser, Debug)]
@@ -179,10 +245,15 @@ async fn run(cli: Cli) {
 		semaphores.insert(name.clone(), Arc::new(Semaphore::new(route.concurrency)));
 	}
 
+	let auth_semaphore = Arc::new(Semaphore::new(4));
+	let failure_tracker = Arc::new(FailureTracker::new(10, Duration::from_secs(600)));
+
 	let state = Arc::new(AppState {
 		config: config.clone(),
 		keys,
 		semaphores,
+		auth_semaphore,
+		failure_tracker,
 	});
 
 	let mut router = Router::new();
@@ -207,6 +278,26 @@ async fn run(cli: Cli) {
 
 	info!("[+] listening on {}", addr);
 	let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+	// spawn background task to clean up rate limiter storage
+	let governor_conf = Arc::new(
+		tower_governor::governor::GovernorConfigBuilder::default()
+			.per_second(2)
+			.burst_size(5)
+			.finish()
+			.unwrap(),
+	);
+	let limiter = governor_conf.limiter().clone();
+	tokio::spawn(async move {
+		let interval = Duration::from_secs(60);
+		loop {
+			tokio::time::sleep(interval).await;
+			limiter.retain_recent();
+		}
+	});
+
+	let router = router.layer(GovernorLayer::new(governor_conf));
+
 	axum::serve(
 		listener,
 		router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -244,14 +335,54 @@ async fn handle_route(
 		.and_then(|h| h.to_str().ok())
 		.ok_or((StatusCode::UNAUTHORIZED, "Missing auth header".to_string()))?;
 
+	let client_ip = addr.ip();
+
+	// check failure tracker before any auth work
+	if state.failure_tracker.is_blocked(client_ip) {
+		warn!(
+			"[!] blocked: {} exceeded failure threshold",
+			client_ip
+		);
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		return Err((StatusCode::TOO_MANY_REQUESTS, "Too many failed attempts".to_string()));
+	}
+
 	let route_keys = state.keys.get(&route_name).ok_or((
 		StatusCode::INTERNAL_SERVER_ERROR,
 		"Keys not loaded for route".to_string(),
 	))?;
 
-	if !route_keys.verify(auth_key) {
+	// acquire global auth semaphore to cap in-flight yescrypt work
+	let auth_permit = match state.auth_semaphore.clone().try_acquire_owned() {
+		Ok(p) => p,
+		Err(_) => {
+			warn!("[!] auth concurrency limit reached");
+			tokio::time::sleep(Duration::from_millis(500)).await;
+			return Err((
+				StatusCode::SERVICE_UNAVAILABLE,
+				"Auth concurrency limit reached".to_string(),
+			));
+		}
+	};
+
+	// run yescrypt in a blocking thread
+	let key_clone = auth_key.to_string();
+	let keys_for_verify = route_keys.clone();
+	let verified = tokio::task::spawn_blocking(move || keys_for_verify.verify(&key_clone))
+		.await
+		.unwrap_or(false);
+
+	drop(auth_permit);
+
+	if !verified {
+		state.failure_tracker.record(client_ip, false);
+		warn!("[!] auth failed: {} from {}", route_name, client_ip);
+		// Step 4: Tarpit on auth failure
+		tokio::time::sleep(Duration::from_millis(500)).await;
 		return Err((StatusCode::UNAUTHORIZED, "Invalid auth key".to_string()));
 	}
+
+	state.failure_tracker.record(client_ip, true);
 
 	let permit = match semaphore.try_acquire_owned() {
 		Ok(p) => p,
@@ -342,4 +473,124 @@ async fn handle_route(
 	let combined_stream = stream::select(stdout_stream, stderr_stream);
 
 	Ok(Sse::new(combined_stream).keep_alive(KeepAlive::default()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use yescrypt::PasswordHasher;
+
+	#[test]
+	fn test_keys_verify_valid() {
+		let yescrypt = Yescrypt::default();
+		let hash_obj = yescrypt
+			.hash_password(b"super53cr37")
+			.expect("hashing failed");
+		let hash_str = hash_obj.to_string();
+		let key_id = "testkey1";
+		let keys = Keys {
+			hashes: {
+				let mut m = HashMap::new();
+				m.insert(key_id.to_string(), vec![hash_str.clone()]);
+				m
+			},
+		};
+		assert!(yescrypt.verify_password(b"super53cr37", hash_str.as_str()).is_ok());
+		assert!(keys.verify(&format!("{}.{}", key_id, "super53cr37")));
+	}
+
+	#[test]
+	fn test_keys_verify_wrong_secret() {
+		let yescrypt = Yescrypt::default();
+		let hash = yescrypt
+			.hash_password(b"correct")
+			.expect("hashing failed")
+			.to_string();
+		let key_id = "testkey2";
+		let keys = Keys {
+			hashes: {
+				let mut m = HashMap::new();
+				m.insert(key_id.to_string(), vec![hash]);
+				m
+			},
+		};
+		assert!(!keys.verify(&format!("{}.{}", key_id, "wrong")));
+	}
+
+	#[test]
+	fn test_keys_verify_unknown_id() {
+		let keys = Keys {
+			hashes: {
+				let mut m = HashMap::new();
+				m.insert("otherid".to_string(), vec!["$y$j9T$hash".to_string()]);
+				m
+			},
+		};
+		assert!(!keys.verify("unknownid.secret"));
+	}
+
+	#[test]
+	fn test_keys_verify_no_dot() {
+		let keys = Keys {
+			hashes: {
+				let mut m = HashMap::new();
+				m.insert("id".to_string(), vec!["$y$j9T$hash".to_string()]);
+				m
+			},
+		};
+		assert!(!keys.verify("noseparator"));
+	}
+
+	#[test]
+	fn test_keys_from_file_rejects_malformed() {
+		let dir = std::env::temp_dir();
+		let path = dir.join("cause_test_malformed_keys");
+		fs::write(&path, "$y$j9T$xlKmMsoZxul/zvPXLC/Aj.$m0BFqZYiyDAF7bh/Tb3.CDTH5kgmBfBRhXbKAO0nco7\n").unwrap();
+		let result = Keys::from_file(path.to_str().unwrap());
+		assert!(result.is_err());
+		fs::remove_file(&path).ok();
+	}
+
+	#[test]
+	fn test_keys_from_file_accepts_keyid_format() {
+		let dir = std::env::temp_dir();
+		let path = dir.join("cause_test_keyid_keys");
+		fs::write(&path, "a1b2c3d4:$y$j9T$xlKmMsoZxul/zvPXLC/Aj.$m0BFqZYiyDAF7bh/Tb3.CDTH5kgmBfBRhXbKAO0nco7\n").unwrap();
+		let result = Keys::from_file(path.to_str().unwrap());
+		assert!(result.is_ok());
+		fs::remove_file(&path).ok();
+	}
+
+	#[test]
+	fn test_failure_tracker_blocks_after_threshold() {
+		let tracker = FailureTracker::new(3, Duration::from_secs(60));
+		let addr = "127.0.0.1".parse::<IpAddr>().unwrap();
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		assert!(tracker.is_blocked(addr));
+	}
+
+	#[test]
+	fn test_failure_tracker_clears_on_success() {
+		let tracker = FailureTracker::new(3, Duration::from_secs(60));
+		let addr = "127.0.0.1".parse::<IpAddr>().unwrap();
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		tracker.record(addr, true);
+		assert!(!tracker.is_blocked(addr));
+	}
+
+	#[test]
+	fn test_failure_tracker_success_only_clears_own_ip() {
+		let tracker = FailureTracker::new(3, Duration::from_secs(60));
+		let addr_a = "10.0.0.1".parse::<IpAddr>().unwrap();
+		let addr_b = "10.0.0.2".parse::<IpAddr>().unwrap();
+		tracker.record(addr_a, false);
+		tracker.record(addr_a, false);
+		tracker.record(addr_a, false);
+		assert!(tracker.is_blocked(addr_a));
+		tracker.record(addr_b, true);
+		assert!(tracker.is_blocked(addr_a));
+	}
 }

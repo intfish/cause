@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tracing::{error, info};
+use tokio::sync::Semaphore;
+use tracing::{warn, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use yescrypt::password_hash::PasswordVerifier;
 use yescrypt::Yescrypt;
@@ -47,6 +48,12 @@ struct RouteConfig {
 	shell: String,
 	args: Vec<String>,
 	keys: String,
+	#[serde(default = "default_concurrency")]
+	concurrency: usize,
+}
+
+fn default_concurrency() -> usize {
+	1
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -94,6 +101,7 @@ impl Keys {
 struct AppState {
 	config: Config,
 	keys: HashMap<String, Keys>,
+	semaphores: HashMap<String, Arc<Semaphore>>,
 }
 
 #[derive(Parser, Debug)]
@@ -157,17 +165,23 @@ async fn run(cli: Cli) {
 		}
 	}
 
-	let state = Arc::new(AppState { config: config.clone(), keys });
+	let mut semaphores = HashMap::new();
+	for (name, route) in &config.routes {
+		semaphores.insert(name.clone(), Arc::new(Semaphore::new(route.concurrency)));
+	}
+
+	let state = Arc::new(AppState { config: config.clone(), keys, semaphores });
 
 	let mut router = Router::new();
 
 	for (route_name, _) in &config.routes {
 		let route_path = format!("/{}", route_name);
+		let semaphore = state.semaphores.get(route_name).unwrap().clone();
 		info!("[+] route: {}", route_path);
 		let route_name_cloned = route_name.clone();
 		router = router.route(
 			&route_path,
-			get(move |headers, connect_info, state| handle_route(route_name_cloned, headers, connect_info, state)),
+			get(move |headers, connect_info, state| handle_route(route_name_cloned, headers, connect_info, state, semaphore)),
 		);
 	}
 
@@ -186,6 +200,7 @@ async fn handle_route(
 	headers: HeaderMap,
 	ConnectInfo(addr): ConnectInfo<SocketAddr>,
 	State(state): State<Arc<AppState>>,
+	semaphore: Arc<Semaphore>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, (StatusCode, String)> {
 	let x_forwarded_for = headers
 		.get("X-Forwarded-For")
@@ -193,7 +208,7 @@ async fn handle_route(
 		.unwrap_or("-");
 
 	info!(
-		"[+] start: {}: client_ip: {}, x_forwarded_for: {}",
+		"[+] request: {}: client_ip: {}, x_forwarded_for: {}",
 		route_name, addr, x_forwarded_for
 	);
 
@@ -217,6 +232,17 @@ async fn handle_route(
 		return Err((StatusCode::UNAUTHORIZED, "Invalid auth key".to_string()));
 	}
 
+	let permit = match semaphore.try_acquire_owned() {
+		Ok(p) => p,
+		Err(_) => {
+			warn!("[!] route concurrency limit reached: {}", route_name);
+			return Err((
+				StatusCode::SERVICE_UNAVAILABLE,
+				"Route concurrency limit reached".to_string(),
+			));
+		}
+	};
+
 	let mut child = Command::new(&route_config.shell)
 		.args(&route_config.args)
 		.stdout(std::process::Stdio::piped())
@@ -227,6 +253,10 @@ async fn handle_route(
 			(StatusCode::INTERNAL_SERVER_ERROR, "Failed to execute shell".to_string())
 		})?;
 
+	info!(
+		"[+] spawn: {}: client_ip: {}, x_forwarded_for: {}",
+		route_name, addr, x_forwarded_for
+	);
 	let stdout = child.stdout.take().unwrap();
 	let stderr = child.stderr.take().unwrap();
 
@@ -234,14 +264,18 @@ async fn handle_route(
 
 	tokio::spawn(async move {
 		match tokio::time::timeout(timeout_duration, child.wait()).await {
-			Ok(status) => {
-				info!("[+] exit: {}: {:?}", route_name, status);
+			Ok(Ok(status)) => {
+				info!("[+] exit: {}: return: {:?}", route_name, status.code().unwrap_or(-1));
+			}
+			Ok(Err(e)) => {
+				error!("[!] failed to wait on child: {}: {}", route_name, e);
 			}
 			Err(_) => {
 				error!("[!] timeout, killing: {}", route_name);
 				let _ = child.kill().await;
 			}
 		}
+		drop(permit);
 	});
 
 	let stdout_reader = BufReader::new(stdout).lines();

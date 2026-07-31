@@ -4,6 +4,8 @@ cause provides a basic and argument-less API for triggering things in remote mac
 
 ## usage
 
+Use behind a reverse proxy like caddy or nginx that provides TLS termination.
+
 ```sh
 Usage: cause [OPTIONS]
 
@@ -15,7 +17,7 @@ Options:
   -V, --version            Print version
 ```
 
-generating a key:
+Generating a key:
 
 ```sh
 mkpasswd super53cr37 >> keys

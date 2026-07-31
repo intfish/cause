@@ -7,3 +7,4 @@
 shell = "/usr/bin/bash"
 args = [ "examples/loop.sh" ]
 keys = "examples/keys"
+concurrency = 1

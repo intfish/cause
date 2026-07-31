@@ -9,7 +9,7 @@ use axum::{
 use clap::Parser;
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info};
@@ -63,8 +63,37 @@ struct OutputLine {
 	line: String,
 }
 
+struct Keys {
+	hashes: Vec<String>,
+}
+
+impl Keys {
+	fn from_file(path: &str) -> Result<Self, String> {
+		let content = fs::read_to_string(path).map_err(|e| format!("failed to read keys file {}: {}", path, e))?;
+		let mut hashes = Vec::new();
+		for line in content.lines() {
+			let hash = line.trim().to_string();
+			if hash.is_empty() {
+				continue;
+			}
+			hashes.push(hash);
+		}
+		Ok(Self { hashes })
+	}
+
+	fn verify(&self, key: &str) -> bool {
+		for hash in &self.hashes {
+			if Yescrypt::default().verify_password(key.as_bytes(), hash.as_str()).is_ok() {
+				return true;
+			}
+		}
+		false
+	}
+}
+
 struct AppState {
 	config: Config,
+	keys: HashMap<String, Keys>,
 }
 
 #[derive(Parser, Debug)]
@@ -114,7 +143,21 @@ async fn run(cli: Cli) {
 		}
 	};
 
-	let state = Arc::new(AppState { config: config.clone() });
+	let mut keys = HashMap::new();
+	for (name, route) in &config.routes {
+		match Keys::from_file(&route.keys) {
+		Ok(parsed) => {
+				info!("[+] loaded keys for route: {}", name);
+				keys.insert(name.clone(), parsed);
+			},
+			Err(e) => {
+				error!("[!] {}", e);
+				std::process::exit(1);
+			},
+		}
+	}
+
+	let state = Arc::new(AppState { config: config.clone(), keys });
 
 	let mut router = Router::new();
 
@@ -165,7 +208,12 @@ async fn handle_route(
 		.and_then(|h| h.to_str().ok())
 		.ok_or((StatusCode::UNAUTHORIZED, "Missing auth header".to_string()))?;
 
-	if !authenticate(auth_key, &route_config.keys).await {
+	let route_keys = state.keys.get(&route_name).ok_or((
+		StatusCode::INTERNAL_SERVER_ERROR,
+		"Keys not loaded for route".to_string(),
+	))?;
+
+	if !route_keys.verify(auth_key) {
 		return Err((StatusCode::UNAUTHORIZED, "Invalid auth key".to_string()));
 	}
 
@@ -228,27 +276,4 @@ async fn handle_route(
 	let combined_stream = stream::select(stdout_stream, stderr_stream);
 
 	Ok(Sse::new(combined_stream).keep_alive(KeepAlive::default()))
-}
-
-async fn authenticate(key: &str, keys_file: &str) -> bool {
-	let content = match tokio::fs::read_to_string(keys_file).await {
-		Ok(c) => c,
-		Err(e) => {
-			error!("[!] failed to read keys file {}: {}", keys_file, e);
-			return false;
-		}
-	};
-
-	for line in content.lines() {
-		let hash = line.trim();
-		if hash.is_empty() {
-			continue;
-		}
-
-		if Yescrypt::default().verify_password(key.as_bytes(), hash).is_ok() {
-			return true;
-		}
-	}
-
-	false
 }

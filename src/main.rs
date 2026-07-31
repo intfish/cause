@@ -128,6 +128,11 @@ impl Keys {
 	}
 }
 
+/// Tracks per-IP auth failures and blocks IPs exceeding the threshold.
+///
+/// Uses a fixed window: the timer starts on the first failure.
+/// 10 failures must occur within `window` of that first failure to trigger a block.
+/// If the window expires, the counter resets - not a rolling window.
 struct FailureTracker {
 	fails: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 	max_fails: u32,
@@ -166,6 +171,20 @@ impl FailureTracker {
 			}
 			None => false,
 		}
+	}
+
+	fn refresh_block(&self, addr: IpAddr) {
+		let mut map = self.fails.lock().unwrap();
+		if let Some((count, since)) = map.get_mut(&addr) {
+			if *count >= self.max_fails && since.elapsed() <= self.window {
+				*since = Instant::now();
+			}
+		}
+	}
+
+	fn prune(&self) {
+		let mut map = self.fails.lock().unwrap();
+		map.retain(|_, (_, since)| since.elapsed() <= self.window);
 	}
 }
 
@@ -271,6 +290,7 @@ async fn run(cli: Cli) {
 		);
 	}
 
+	let failure_tracker = state.failure_tracker.clone();
 	let router = router.with_state(state);
 
 	let addr_str = format!("{}:{}", cli.address, cli.port);
@@ -279,7 +299,7 @@ async fn run(cli: Cli) {
 	info!("[+] listening on {}", addr);
 	let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
-	// spawn background task to clean up rate limiter storage
+	// spawn background task to clean up rate limiter and failure tracker storage
 	let governor_conf = Arc::new(
 		tower_governor::governor::GovernorConfigBuilder::default()
 			.per_second(2)
@@ -293,6 +313,7 @@ async fn run(cli: Cli) {
 		loop {
 			tokio::time::sleep(interval).await;
 			limiter.retain_recent();
+			failure_tracker.prune();
 		}
 	});
 
@@ -339,6 +360,7 @@ async fn handle_route(
 
 	// check failure tracker before any auth work
 	if state.failure_tracker.is_blocked(client_ip) {
+		state.failure_tracker.refresh_block(client_ip);
 		warn!(
 			"[!] blocked: {} exceeded failure threshold",
 			client_ip
@@ -368,9 +390,15 @@ async fn handle_route(
 	// run yescrypt in a blocking thread
 	let key_clone = auth_key.to_string();
 	let keys_for_verify = route_keys.clone();
-	let verified = tokio::task::spawn_blocking(move || keys_for_verify.verify(&key_clone))
+	let verified = match tokio::task::spawn_blocking(move || keys_for_verify.verify(&key_clone))
 		.await
-		.unwrap_or(false);
+	{
+		Ok(result) => result,
+		Err(e) => {
+			error!("[!] spawn_blocking panic during auth: {}", e);
+			false
+		}
+	};
 
 	drop(auth_permit);
 
@@ -592,5 +620,48 @@ mod tests {
 		assert!(tracker.is_blocked(addr_a));
 		tracker.record(addr_b, true);
 		assert!(tracker.is_blocked(addr_a));
+	}
+
+	#[test]
+	fn test_failure_tracker_prune_removes_stale() {
+		let tracker = FailureTracker::new(3, Duration::from_millis(50));
+		let addr = "127.0.0.1".parse::<IpAddr>().unwrap();
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		assert!(tracker.is_blocked(addr));
+		std::thread::sleep(Duration::from_millis(100));
+		tracker.prune();
+		assert!(!tracker.is_blocked(addr));
+	}
+
+	#[test]
+	fn test_failure_tracker_prune_keeps_fresh() {
+		let tracker = FailureTracker::new(3, Duration::from_secs(60));
+		let addr = "127.0.0.1".parse::<IpAddr>().unwrap();
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		assert!(tracker.is_blocked(addr));
+		tracker.prune();
+		assert!(tracker.is_blocked(addr));
+	}
+
+	#[test]
+	fn test_failure_tracker_refresh_extends_block() {
+		let tracker = FailureTracker::new(3, Duration::from_millis(200));
+		let addr = "127.0.0.1".parse::<IpAddr>().unwrap();
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		tracker.record(addr, false);
+		assert!(tracker.is_blocked(addr));
+		std::thread::sleep(Duration::from_millis(150));
+		assert!(tracker.is_blocked(addr));
+		tracker.refresh_block(addr);
+		assert!(tracker.is_blocked(addr));
+		std::thread::sleep(Duration::from_millis(50));
+		assert!(tracker.is_blocked(addr));
+		std::thread::sleep(Duration::from_millis(160));
+		assert!(!tracker.is_blocked(addr));
 	}
 }

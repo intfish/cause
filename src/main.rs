@@ -13,8 +13,8 @@ mod config;
 mod handler;
 mod tests;
 
-use config::{Config, validate_route_name};
 use auth::{FailureTracker, Keys};
+use config::{Config, validate_route_name};
 use handler::{AppState, rate_limited};
 
 #[derive(Parser, Debug)]
@@ -166,9 +166,7 @@ async fn main() {
 		)
 	};
 
-	match axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
-		.await
-	{
+	match axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await {
 		Ok(()) => {}
 		Err(e) => {
 			error!("[!] server error: {}", e);

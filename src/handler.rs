@@ -1,13 +1,16 @@
+use crate::auth::{FailureTracker, Keys, OutputLine, resolve_client_ip};
+use crate::config::Config;
 use axum::{
+	Router,
+	extract::{self as ax_extract, Path, State},
+	http::{HeaderMap, StatusCode},
 	response::{
 		Sse,
 		sse::{Event, KeepAlive},
 	},
-	http::{HeaderMap, StatusCode},
-	extract::{self as ax_extract, Path, State},
-	Router,
 };
 use futures_util::stream::{self, Stream};
+use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,9 +19,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
-use nix::unistd::Pid;
-use crate::config::Config;
-use crate::auth::{FailureTracker, Keys, OutputLine, resolve_client_ip};
 
 pub struct AppState {
 	pub(crate) config: Config,
@@ -29,7 +29,13 @@ pub struct AppState {
 }
 
 impl AppState {
-	pub fn new(config: Config, keys: HashMap<String, Keys>, semaphores: HashMap<String, Arc<Semaphore>>, auth_semaphore: Arc<Semaphore>, failure_tracker: Arc<FailureTracker>) -> Self {
+	pub fn new(
+		config: Config,
+		keys: HashMap<String, Keys>,
+		semaphores: HashMap<String, Arc<Semaphore>>,
+		auth_semaphore: Arc<Semaphore>,
+		failure_tracker: Arc<FailureTracker>,
+	) -> Self {
 		Self {
 			config,
 			keys,
@@ -52,7 +58,8 @@ where
 			.per_second(2)
 			.burst_size(5)
 			.key_extractor(key_extractor)
-			.finish() {
+			.finish()
+		{
 			Some(c) => c,
 			None => {
 				tracing::error!("[!] failed to build governor config");

@@ -51,5 +51,6 @@ pub struct Config {
 }
 
 pub fn validate_route_name(name: &str) -> bool {
-	name.chars().all(|c| !matches!(c, '/' | '{' | '}' | ' ' | '\t' | '\n' | '\r'))
+	name.chars()
+		.all(|c| !matches!(c, '/' | '{' | '}' | ' ' | '\t' | '\n' | '\r'))
 }

@@ -2,10 +2,10 @@ use axum::http::HeaderMap;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, Instant};
 use std::sync::Mutex;
-use yescrypt::password_hash::PasswordVerifier;
+use std::time::{Duration, Instant};
 use yescrypt::Yescrypt;
+use yescrypt::password_hash::PasswordVerifier;
 
 /// Resolves the effective client IP from the TCP peer address and proxy headers.
 /// X-Forwarded-For => X-Real-IP => TCP peer address
@@ -132,7 +132,9 @@ impl FailureTracker {
 	pub fn refresh_block(&self, addr: IpAddr) {
 		let mut map = self.fails.lock().unwrap();
 		if let Some((count, since)) = map.get_mut(&addr)
-			&& *count >= self.max_fails && since.elapsed() <= self.window {
+			&& *count >= self.max_fails
+			&& since.elapsed() <= self.window
+		{
 			*since = Instant::now();
 		}
 	}

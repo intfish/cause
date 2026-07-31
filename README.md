@@ -7,7 +7,7 @@ things to note:
 
 ## usage
 
-Use behind a reverse proxy like caddy or nginx that provides TLS termination.
+use behind a reverse proxy like caddy or nginx that provides TLS termination.
 
 ```sh
 Usage: cause [OPTIONS]
@@ -20,7 +20,7 @@ Options:
   -V, --version            Print version
 ```
 
-Generating a key: `./key.sh <key>`
+#### generating a key: `./key.sh <key>`
 
 ```sh
 # it does the following:
@@ -31,8 +31,8 @@ KEYID=$(head -c 4 /dev/urandom | xxd -p)
 echo "${KEYID}:${HASH}" >> keys
 ```
 
-Use the full key (`keyid.secret`) as the value in the `x-api-key` (by default) header.
+use the full key (`keyid.secret`) as the value in the `x-api-key` (by default) header.
 
 ## development
 
-The example key in `example/keys` is `a1b2c3d4.dev`.
+the example key in `example/keys` is `a1b2c3d4.dev`.

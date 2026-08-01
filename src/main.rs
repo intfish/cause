@@ -3,6 +3,7 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{error, info};
@@ -100,6 +101,11 @@ async fn main() {
 		};
 		if !metadata.is_file() {
 			error!("[!] shell for route {} is not a file: {}", name, route.shell);
+			std::process::exit(1);
+		}
+		let mode = metadata.permissions().mode() & 0o777;
+		if mode & 0o111 == 0 {
+			error!("[!] shell for route {} is not executable: {}", name, route.shell);
 			std::process::exit(1);
 		}
 		let keys_path = std::path::Path::new(&route.keys);

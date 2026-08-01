@@ -4,6 +4,7 @@ cause provides a basic and argument-less API for triggering things in remote mac
 
 things to note:
 - the process, once triggered, will run to completion/timeout even if the triggering party disconnects
+- targets only linux systems
 
 ## usage
 

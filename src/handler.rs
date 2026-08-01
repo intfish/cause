@@ -191,7 +191,9 @@ pub async fn handle_route(
 			}
 			Err(_) => {
 				error!("[!] timeout, killing process group for: {}", route_name);
-				let _ = nix::sys::signal::killpg(Pid::from_raw(0), nix::sys::signal::Signal::SIGTERM);
+				if let Some(pid) = child.id() {
+					let _ = nix::sys::signal::killpg(Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGTERM);
+				}
 				let _ = child.kill().await;
 			}
 		}

@@ -3,8 +3,28 @@
 # auth_header = 'x-api-key'
 # timeout = 900
 # trusted_proxies = ["127.0.0.1", "::1"]
+# auth_semaphore_size = 4
+# failure_threshold = 10
+# failure_window_secs = 600
+# block_duration_secs = 600
+# tarpit_duration_ms = 500
+# rate_limit_per_second = 2
+# rate_limit_burst = 5
+# kill_grace_secs = 1
+# drain_grace_secs = 2
+# max_line_length = 65536
+# failure_max_entries = 100000
+# auth_acquire_timeout_ms = 2000
+# max_inflight_auth_per_ip = 2
+# max_auth_queue_depth = 64
 
-[routes.example]
+[routes.hello]
+shell = "/usr/bin/bash"
+args = [ "examples/hello.sh" ]
+keys = "examples/keys"
+concurrency = 1
+
+[routes.loop]
 shell = "/usr/bin/bash"
 args = [ "examples/loop.sh" ]
 keys = "examples/keys"

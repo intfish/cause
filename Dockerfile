@@ -4,9 +4,6 @@ RUN apk add --no-cache musl-dev
 WORKDIR /usr/src/cause
 COPY Cargo.toml ./
 COPY Cargo.lock ./
-
-# creates a dummy src/main.rs to build dependencies and cache them
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
 COPY src ./src
 RUN cargo build --release
 

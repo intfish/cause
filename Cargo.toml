@@ -2,6 +2,11 @@
 name = "cause"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "causes things in machines"
+repository = "https://github.com/intfish/cause"
+keywords = ["http", "webhook", "trigger", "sse", "remote"]
+readme = "README.md"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["macros"] }

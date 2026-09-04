@@ -16,7 +16,10 @@ RUN addgroup -g 1000 cause && adduser -u 1000 -G cause -D cause
 RUN apk add --no-cache ca-certificates bash libgcc
 
 COPY --from=builder /usr/src/cause/target/release/cause /usr/local/bin/cause
-RUN mkdir -p /etc/cause && touch /etc/cause/cause.toml && chmod -R a+r /etc/cause/
+# demo routes referenced by the shipped example config
+COPY examples ./examples
+COPY config.example.toml /etc/cause/cause.toml
+RUN chmod -R a+r /etc/cause/ /examples/
 
 USER cause
 WORKDIR /

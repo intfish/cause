@@ -43,8 +43,8 @@ all fields have defaults; unknown fields are rejected.
 | `rate_limit_per_second`    | `2`           | sustained per-IP request rate                                                                                                                                  |
 | `rate_limit_burst`         | `5`           | per-IP burst allowance on top of the sustained rate                                                                                                            |
 | `kill_grace_secs`          | `1`           | grace period (seconds) between SIGTERM and SIGKILL when terminating a timed-out process                                                                        |
-| `drain_grace_secs`         | `1`           | post-exit grace period for draining the output buffer of the child process                                                                                     |
-| `max_line_length`          | `65536`       | max length (bytes) of a single output line from the triggered process; longer lines are truncated                                                              |
+| `drain_grace_secs`         | `2`           | post-exit grace period for draining the output buffer of the child process                                                                                     |
+| `max_line_length`          | `65536`       | max length (bytes) of a single output line from the triggered process; lines exceeding the limit are discarded and reported as a `[stream truncated]` event   |
 | `failure_max_entries`      | `100000`      | max IPs tracked in the failure table (bounds memory)                                                                                                           |
 | `auth_acquire_timeout_ms`  | `2000`        | max time (milliseconds) to wait for an auth verification slot before rejecting                                                                                 |
 | `max_inflight_auth_per_ip` | `2`           | max concurrent auth attempts per IP                                                                                                                            |
@@ -61,7 +61,9 @@ each route becomes a `POST /<name>` endpoint. route names may only contain ASCII
 | `keys`        | yes               | path to the keys file (see below) authorized for this route                               |
 | `concurrency` | no (default `1`)  | max concurrent executions of this route                                                   |
 
-example:
+keys files are read once at startup; adding or revoking a key requires restarting the service.
+
+example (a fully commented copy is provided in `config.example.toml`):
 
 ```toml
 [global]
@@ -69,7 +71,7 @@ auth_header = "x-api-key"
 timeout = 900
 
 [routes.hello]
-shell = "/usr/bin/bash"
+shell = "/bin/bash"
 args = [ "examples/hello.sh" ]
 keys = "examples/keys"
 concurrency = 1
@@ -94,6 +96,21 @@ echo "${KEYID}:${HASH}" >> keys
 ```
 
 use the full key (`keyid.secret`) as the value in the `x-api-key` (by default) header.
+
+## deployment
+
+- never expose cause directly to untrusted networks; run it behind a reverse proxy that terminates TLS and strips/sets `x-forwarded-for`.
+- configure the proxy's IPs in `trusted_proxies` so rate limiting and failure tracking see the real client IP.
+- the docker image ships with the example configuration at `/etc/cause/cause.toml` so it boots with working demo routes (`hello`, `loop`). mount your own config to replace it, e.g.:
+
+  ```sh
+  docker run -p 3000:3000 \
+    -v "$PWD/cause.toml:/etc/cause/cause.toml:ro" \
+    -v "$PWD/keys:/etc/cause/keys:ro" \
+    ghcr.io/avalahee/cause:latest
+  ```
+
+- `GET /` is unauthenticated and returns `200 OK` for load balancer probes and container health checks; it is also subject to the per-IP rate limit.
 
 ## development
 

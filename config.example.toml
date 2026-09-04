@@ -1,0 +1,85 @@
+# cause example configuration
+#
+# This file is a fully commented starting point. Copy it to `cause.toml`
+# (or mount it into the container at /etc/cause/cause.toml) and adapt.
+# All options shown below are the built-in defaults; you only need to set
+# what you want to override. Unknown options are rejected at startup.
+#
+# Start the local example server with:
+#   cargo run -- --config config.example.toml
+# then trigger a route:
+#   curl -i -XPOST -H 'x-api-key: a1b2c3d4.dev' http://localhost:3000/hello
+
+[global]
+# HTTP header carrying the API key
+auth_header = "x-api-key"
+
+# max runtime (seconds) of a triggered process before it is killed
+timeout = 900
+
+# IPs of reverse proxies allowed to set `x-forwarded-for`; when the peer is
+# trusted, the forwarded client IP is used for rate limiting/failure tracking.
+# NOTE: only exact IPs are supported, and IPv4-mapped IPv6 (::ffff:a.b.c.d)
+# never matches an IPv4 entry. Bind 0.0.0.0 (IPv4 only) if you must list
+# IPv4 proxies.
+trusted_proxies = []
+
+# max concurrent password-hash verifications (bounds CPU usage of auth)
+auth_semaphore_size = 4
+
+# auth failures per IP within `failure_window_secs` before tarpitting kicks in
+failure_threshold = 10
+
+# fixed window (seconds) for counting auth failures: the timer starts at the
+# first failure and the counter resets once the window expires (not a rolling
+# window)
+failure_window_secs = 600
+
+# duration (seconds) an IP remains blocked after exceeding the failure threshold
+block_duration_secs = 600
+
+# delay (milliseconds) applied to every failed auth attempt and to requests
+# from blocked IPs
+tarpit_duration_ms = 500
+
+# sustained per-IP request rate
+rate_limit_per_second = 2
+
+# per-IP burst allowance on top of the sustained rate
+rate_limit_burst = 5
+
+# grace period (seconds) between SIGTERM and SIGKILL when terminating a
+# timed-out process
+kill_grace_secs = 1
+
+# post-exit grace period for draining the output buffer of the child process
+drain_grace_secs = 2
+
+# max length (bytes) of a single output line from the triggered process; lines
+# exceeding the limit are discarded and reported as a `[stream truncated]` event
+max_line_length = 65536
+
+# max IPs tracked in the failure table (bounds memory); blocked IPs are never
+# evicted by this limit
+failure_max_entries = 100000
+
+# max time (milliseconds) to wait for an auth verification slot before rejecting
+auth_acquire_timeout_ms = 2000
+
+# max concurrent auth attempts per IP
+max_inflight_auth_per_ip = 2
+
+# max requests waiting for an auth slot before new ones are rejected
+max_auth_queue_depth = 64
+
+[routes.hello]
+shell = "/bin/bash"
+args = [ "examples/hello.sh" ]
+keys = "examples/keys"
+concurrency = 1
+
+[routes.loop]
+shell = "/bin/bash"
+args = [ "examples/loop.sh" ]
+keys = "examples/keys"
+concurrency = 1
